@@ -1,0 +1,460 @@
+---
+title: "BoardGameGeek Analysis: How to Create the Most Successful Board Game"
+author: "Chase Bonin, Advika Ganish, Cora McAnulty, Aastha Modi"
+date: "2023-12-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+#Put Necessary Libraries Here
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(modelr)
+library(broom)
+library(ggplot2)
+library(mgcv)
+library(kableExtra)
+library(purrr)
+library(caret)
+library(xgboost)
+library(pdp)
+library(knitr)
+library(gridExtra)
+
+
+```
+
+```{r, include=FALSE}
+bg <- read_csv("C:/Users/czbon/Downloads/STOR/STOR320/BG.csv", show_col_types = FALSE) %>%
+              mutate(name = str_replace_all(name, '  ', ': ')) 
+bg$weightgroup = cut(bg$avgweight,
+    breaks = c(0,1, 2, 3, 4,5),
+    include.lowest = T,
+    right = F)
+levels(bg$weightgroup) = c("0-1","1-2","2-3","3-4","4-5")
+
+bg$ComMinBin = cut(as.numeric(bg$min_community),
+    breaks = c(0,1,2,3,4,5,6,7,8,9,10,50),
+    include.lowest = T,
+    right = T)
+levels(bg$ComMinBin)= c("0-1","1-2","2-3","3-4","4-5","5-6", "6-7", "7-8","8-9","9-10","10+")
+
+bg$ComPlayerGroup = cut(as.numeric(bg$min_community),
+    breaks = c(0,1,30),
+    include.lowest = T,
+    right = T)
+levels(bg$ComPlayerGroup) = c("SoloOption","Multi")
+
+bg$kick = factor(bg$kick)
+bg$kickn = as.numeric(bg$kick)
+bg = bg %>% mutate(kickn = kickn-1)
+
+bg = bg %>%
+  mutate(totalmedia = weblink+blogs+podcast+news)
+
+bg = bg %>%
+  filter(baverage>0, totalmedia>0, numplays>0, yearpublished>1975, avgweight >=1) %>%
+  mutate(logtotalmedia = log(totalmedia), lognumplays = log(numplays))
+
+#code for numerical playerage only
+bg <- bg %>%
+  mutate(log_plays=log(numplays+1), totalmedia = news+blogs+podcast+weblink, logtotalmedia = log(totalmedia +1)) %>%
+  filter(baverage != 0) %>%
+  filter(grepl("^\\d+$", playerage)) %>%
+  filter(playerage != '(no votes)') %>%
+  group_by(playerage) %>%
+  add_count(log_plays) 
+
+bg_q2 = bg %>% 
+  mutate(midplaytime = (minplaytime+maxplaytime)/2) %>%
+        filter(baverage>0, totalmedia>0, numplays>0, yearpublished>1975, boardgamemechanic_cnt > 0, avgweight >= 1)
+
+
+
+bg_q1 <- read_csv("C:/Users/czbon/Downloads/STOR/STOR320/BG.csv", show_col_types = FALSE) %>% 
+        mutate(midplaytime = (minplaytime+maxplaytime)/2) %>%
+        mutate(name = str_replace_all(name, '  ', ': ')) %>%
+        mutate(log_plays=log(numplays), totalmedia = news+blogs+podcast+weblink, logtotalmedia = log(totalmedia))%>%
+        filter(baverage>0, totalmedia>0, numplays>0, yearpublished>1975) 
+        
+ 
+head(bg_q1)
+```
+
+**Note:** This is an academic project and, as such, attempts to explicate principles of data analysis and statistical modeling for a general audience. 
+
+# INTRODUCTION
+One might assume that board game popularity is declining as our lives become increasingly centered around technology. On the contrary, the board game market is growing rapidly. In 2023 alone, the revenue of the board game market stands at $3.39 billion, and the global market size is estimated to reach $29.7 billion in 2028. From classics to modern marvels, board games are a celebration of camaraderie, competition, and the joy of unplugged entertainment. There is a wide swath of categories, mechanics, and genres of board games that are catered to various audiences. For all of these board game enthusiasts, BoardGameGeek (BGG) exists as a community-driven website where two million registered users, known as ‘Geeks’, can review, comment, and vote on over 120,000 board games. Geeks can explore specific features from game complexity to individual mechanics with incredible precision. What’s more, they can exchange games with other users and form guilds, allowing the vast online board game community to continue flourishing. The site was called "a resource without peer for board and card gamers, the recognized authority of this online community" when it received the Diana Jones Award for “excellence in gaming.”
+
+As we analyzed the BGG dataset, we looked for relationships between variables from the perspective of board game developers, who manage game design, product development, funding, and marketing. Not only does BGG host a vast database of board games for archival purposes, but it also allows developers to observe how certain features contribute to a board game’s success (or lack thereof). It also allows developers to find playtesters, gather feedback on prototypes, and find crowdfunding opportunities. To measure how well each game was received by the community, we decided to focus on Geeks’ ratings. Our dataset provided us with two variables that represented the user rating: *baverage* and *average*, both on a scale from 1 to 10. We chose *baverage* as our response variable since it included an anti-skew algorithm formulated by BGG, unlike *average* which simply calculated mean values. Initially, we aimed to identify which board game aspects contributed to the highest ratings. During our exploratory analysis, we closely examined relationships among *avgweight* (average complexity rating), *boardgamemechanic_cnt* (number of mechanics), *minage* (minimum age recommendation by publishers), and *baverage*, among other variables. This led us to one important question: What board game aspects have the greatest influence on Geeks’ ratings, and what kind of board game would receive the highest ratings amongst Geeks? 
+ 
+We realized that in addition to the board game aspects already present within the data, crowdfunding could also affect board game development. Crowdfunding refers to the practice of funding a project by raising money from a large number of people, typically strangers on the internet. After fully examining the BGG website, we web scraped Kickstarter data to explore how funding contributed to average ratings. This led to our second question: how do board games that are Kickstarter-funded affect Geeks’ ratings, our models, and other measures of success? Are Kickstarter-funded games a source of competition for traditional board game publishers?
+
+
+
+# DATA
+Our data originates from Kaggle, where contributors Lime and ZakWhite scraped the top 20,000 board games from BoardGameGeek as of January 13, 2020. The dataset has 20,000 rows, each identified by title and objectID, and 52 columns. To clean the data, we filtered out rows with nonsensical zeroes (which we interpretted as indicating missing values), created several new variables based on the averages and/or totals of other variables, and cut several continuous variables into factor variables. When necessary, we filtered out games with extreme values for *yearpublished*, such as Marbles, assigned the *yearpublished* value of -3000 by BGG. Since we are approaching our study from the perspective of developers of a contemporary board game, we only included games released after 1975. This was the first year in our dataset with more than 100 board games published, so we chose this as the cutoff point; this is when the board game world started to look more like what we know it to be now. 
+
+```{r, table_printing, results = "asis",echo=FALSE,fig.align='center',warning=FALSE}
+new_bg <- bg_q1 %>%
+  select('Board Game' = name, 'Weighted User Rating' = baverage, 'Total Media' = logtotalmedia, 'Mechanic Count' = boardgamemechanic_cnt, 'Minimum Age' = minage, 'Minimum Players' = min_community, 'Median Play Time' = midplaytime)
+  
+#head(new_bg,10)
+
+bg_table <- head(new_bg,10)
+
+styled_table <- kable(bg_table, align=rep('c', 10), col.names = gsub("[.]", " ", names(bg_table))) %>%
+  kable_styling(full_width = FALSE, position = "center", latex_options="scale_down") %>%
+  add_header_above(c("Top Ten Board Games (2020)" = ncol(bg_table))) %>%
+  row_spec(0, bold = TRUE, background = '#ef3a3b') %>%
+  column_spec(1, bold = TRUE, color = "white", background = '#551a8b') %>%
+  collapse_rows(columns = 1)
+
+cat(styled_table)
+```
+
+
+
+For our first question, we explored the *baverage* as our response variable. This variable, also known as “Geek Rating”, is calculated from the average rating from 1 to 10 voted on by BGG users, plus a BGG anti-bias algorithm that prevents games with very few ratings from nearing the top of the ranking list. Similar to Bayesian averaging, it involves the addition of “dummy votes” around the middle value (~5.5) to the ratings, so as to pull the average towards the middle. For games with many ratings, the results are minimal; for less popular games, their ratings will be noticeably pulled towards 5.5. BGG also performs algorithms on games that experience review bombing or other artificial rating methods, but does not publicly disclose these. *baverage* values are distributed as such:
+
+```{r,echo=FALSE,fig.align='center', fig.align='center', r,echo=FALSE}
+
+ggplot(bg, aes(x=baverage)) + geom_histogram(binwidth = 0.1,
+                                   fill ="brown2", color = "purple4") + labs(title = "Distribution of Board Game B-average Ratings", x = "B-average", y = "Count")
+
+```
+
+As predictors for the *baverage* variable, our group primarily used average weight, log-transformed total media representation (created by us), total mechanic count, and median play time. The *avgweight* variable measures the complexity (“weight”) of a board game on a scale of 1 to 5. Typically, board games with higher ratings involve more thinking and strategizing, have a greater quantity of rules, and require more technical skill. Like the *baverage* variable, *avgweight* is computed from community voting. However, only a simple averaging technique is used, with no additional anti-skew efforts. The *logtotalmedia* variable is a summation of the four types of media representation of board games: news, blogs, weblinks, and podcasts. We then log-transformed the variable to reduce the skew and approximate a linear relationship. It is important to note that the *news* and *blogs* variables collect all news articles and blogs from BGG, rather than from the entire Internet. Therefore, if a game were to receive major attention in the mainstream media, it may not necessarily have a higher news and blogs value (although it very easily could). *weblink* and *podcast* variables, however, are sourced from both within and outside of BGG. These variables count the number of weblinks and podcasts linked and promoted on the BGG website for each game. *midplaytime*, also created by us, is the median/average between the minimum and maximum play time in minutes specified by the game developers. There were two severe outliers, including a *midplaytime* of 60,000 minutes, belonging to The Campaign for North Africa, a war simulation game from 1979 designed to be played over a 40-day period. We filtered these two values out due to their extreme distance from the average *midplaytime*.
+
+For our second question, we web scraped data pertaining to whether or not a game was crowdfunded by Kickstarter, a global crowdfunding site where users can donate money to projects they want to see succeed. Kickstarter differs from sites like GoFundMe in that it’s primarily focused on funding creative projects. BGG tags games that are crowdfunded via Kickstarter with the tag “Crowdfunding: Kickstarter''. We scraped a list of every game with this tag and used the *objectid* variable as a key to merge this new dataframe with our previous dataframe. We were left with the binary variable *kick* that has a 1 if the game was funded at least in part by a Kickstarter and a 0 if otherwise. Because Kickstarter was founded in 2009, we removed any games that were listed as having been funded from Kickstarter but had a *yearpublished* before 2009. We ended up with 1,584 board games that were funded via Kickstarter.
+
+
+
+# RESULTS
+**Question 1:**
+
+We approached our questions from the perspective of a board game developer trying to craft a game worthy of high ratings from Geeks. We decided not to include several variables that have no practical usage by board game designers. These variables, including *siteviews*, *numwanting*, and *boardgamehonor_cnt*, created models with very low root mean square errors (RMSEs) in predicting *baverage*, but their emergence strictly after the publication of game limits their usefulness. 
+
+Our initial modeling tests consisted of linear, polynomial, and generalized additive models, the quality of which were assessed via leave-one-out cross-validation. This gave us a glimpse of which variables were the most relevant. Based on trial and error, we decided on the variables *avgweight*, *logtotalmedia*, *boardgamemechanic_cnt*, and *midplaytime*. Although *logtotalmedia* is mostly relevant after the publication of a board game - as most media centered around a board game is created after its publication - we included it in initial modeling under the assumption that a developer could have some influence over media via marketing. Other variables in our dataset may have reduced the RMSE further, but to such a marginal extent that their inclusion would not be worth complexifying our model.
+
+We then moved onto machine learning techniques. Switching to k-fold cross-validation with 20 k-folds, we experimented with k-nearest neighbors algorithms, support vector machines, and multivariate adaptive regression splines, among others. Ultimately, however, we found the most success with gradient boosting. Gradient boosting machines (GBM) are a type of “ensemble learning,” involving the training and combination of many different models to create more accurate predictions, where each successive model improves upon the errors of the previous --- herein lies the "boosting" process. These models begin as “weak learners,” weak insofar as they perform only slightly better than random chance alone. Within GBM, they take the form of decision trees, tree-like structures that branch out based on the answers to particular questions, operating like a flowchart. These questions, each representing a decision node, assess whether a specific feature (variable) is above or below a certain threshold. Intentionally made "weak," the decision trees are typically shallow and utilize a very limited amount of data. 
+
+The steps of GBM include fitting a weak model, computing the pseudo-residuals between the model and the target values, training a decision tree to compute the residuals, and then merging these two models, with the subsequent model weighted down as per the learning rate. Weighing these models down with, for example, a 0.01 learning rate, allows the learning process to occur slowly. This minimizes overfitting, the phenomenon where a model is too tightly fitted to the training data set and cannot generalize well to testing data sets. As each successive model adds information to the previous model to reduce error, the algorithm approaches, based on our chosen loss function, a minimized RMSE.
+
+To assist with gradient boosting regression, our group used the XGBoost library (eXtreme Gradient Boosting), because of its quick execution speed and flexibility. One by one, we tweaked the parameters of our model. These included the learning rate, tuned to 0.01 (as discussed previously), maximum decision tree depth, tuned to 3 (the maximum number of horizontal levels of decision nodes that branch off from a single tree), and gamma, tuned to 0.02 (minimum loss reduction required to create an additional level of nodes within a tree), among others. Like the learning rate, the maximum depth and gamma are also adjusted to control overfitting, in addition to reducing the error of the model. With a total of 10,000 trees, our RMSE was ultimately 0.1950. This means, on average, our model predicted b-averages with a 0.195 distance from the actual b-averages.
+
+
+```{r,warning=F,echo=FALSE,include=FALSE,fig.align='center'}
+
+set.seed(154)
+bg_q1 <-bg %>% filter(avgweight >= 1, midplaytime > 0, midplaytime < 1000, boardgamemechanic_cnt > 0)
+
+train_control <- trainControl(method = "cv", number = 10)
+
+model_formula <- as.formula("baverage ~ logtotalmedia + avgweight + boardgamemechanic_cnt + midplaytime")
+
+xgb_grid <- expand.grid(nrounds = 6000, max_depth = 3, eta = 0.01, gamma = 0.02, colsample_bytree = 1, min_child_weight = 1, subsample = 1)
+
+model <- train(model_formula, 
+               data = bg_q1, 
+               method = "xgbTree", 
+               trControl = train_control, 
+               tuneGrid = xgb_grid) 
+
+print(model)
+varImp(model, scale = FALSE)
+
+
+```
+
+```{r,echo=FALSE,fig.align='center'}
+
+importance <- varImp(model, scale = FALSE)
+importance_df <- as.data.frame(importance$importance)
+importance_df$variable <- rownames(importance_df)
+colors <- ifelse(importance_df$variable == "logtotalmedia", "brown2", 'purple4')
+ggplot(importance_df, aes(x = reorder(variable, Overall), y = Overall)) + geom_bar(stat = "identity", fill = colors) + coord_flip() + labs(x = "Feature", y = "Importance", title = 'Importance (Gain) of Each Feature in Predicting B-average')
+```
+
+```{r,warning=FALSE,include=FALSE}
+set.seed(154)
+bg_q1_alt <- bg_q1 %>% filter(maxplayers != 999, boardgameartist_cnt != 508, boardgamecategory_cnt > 0)
+
+train_control_alt <- trainControl(method = "cv", number = 10)
+
+model_formula_alt <- as.formula("baverage ~ avgweight + boardgamemechanic_cnt + midplaytime + playerage + maxplayers + boardgamecategory_cnt + minplayers")
+
+xgb_grid_alt <- expand.grid(nrounds = 6000, max_depth = 3, eta = 0.01, gamma = 0.02, colsample_bytree = 1, min_child_weight = 1, subsample = 1)
+
+model_alt <- train(model_formula_alt, 
+               data = bg_q1_alt, 
+               method = "xgbTree", 
+               trControl = train_control_alt, 
+               tuneGrid = xgb_grid_alt) 
+
+```
+
+
+```{r,echo=FALSE,fig.align='center'}
+importance_alt <- varImp(model_alt, scale = FALSE)
+importance_df_alt <- as.data.frame(importance_alt$importance)
+importance_df_alt$variable <- rownames(importance_df_alt)
+colors <- ifelse(importance_df_alt$variable == "avgweight" | importance_df_alt$variable == "boardgamemechanic_cnt", "brown2", 'purple4')
+importance_df_alt_gg <-ggplot(importance_df_alt, aes(x = reorder(variable, Overall), y = Overall)) + geom_bar(stat = "identity", fill = colors) + coord_flip() + labs(x = "Feature", y = "Importance", title = 'Importance (Gain) of Each Feature in Predicting B-average')
+importance_df_alt_gg
+
+
+```
+
+
+Our analysis began with the above (top) chart of each feature’s relative importance as a proportion. The number represents the gain of each feature, or its level of utilization by the model relative to other features. *logtotalmedia* dominated the model, with a gain of 0.9460, indicating that the model was most reliant, by far, on this feature as a predictor for *baverage*, among the specified features. As previously mentioned, *logtotalmedia* can be influenced before and after the publication of a board game. Since we wanted to look further into the effects of variables that are strictly applicable before publication (variables a developer would have complete control over), we ran a second model removing it from the list of features. To this end, we also added variables *minplayers*, *maxplayers*, *boardgamecategory_cnt*, and *playerage*. Without *logtotalmedia*, the RMSE of our model increased from 0.1950 to 0.3618, an expected increase given the predictive power of *logtotalmedia*. More notably, *avgweight* and *boardgamemechanic_cnt* became the two highest variables in the new relative importance chart above (bottom), with gains of 0.4062 and 0.3769. These indicate that the second model used these two variables significantly more than the others to make its predictions, and we can assume they are worth the most consideration to board game developers. These findings corroborate each other --- games with more mechanics have gameplay that is inherently more complex and nuanced. That the model deems these the most useful predictors of *baverage* suggests that board game players generally rate more difficult board games with more mechanics higher than their counterparts. It also suggests that players are more open-minded when it comes to player counts, play time, and the number of thematic identities within the game. For board game developers, then, the complexity of a board game and the number of mechanics within a game should likely be of greatest interest as well. However, this model alone only indicates to what extent these two variables alter the prediction, not how exactly they influence it. To further investigate this, our group created partial dependence plots (PDPs) of the top three features, as shown below.
+
+```{r,echo=FALSE,fig.align='center'}
+cv_alt <- data.matrix(bg_q1_alt)
+
+pdp_avgweight_alt <- partial(
+  model_alt, 
+  pred.var = "avgweight", 
+  ice = TRUE, 
+  center = TRUE, 
+  plot = TRUE, 
+  rug = TRUE, 
+  alpha = 0.1, 
+  plot.engine = "ggplot2", 
+  train = cv_alt, 
+  type = "regression"
+)
+
+pdp_df <- pdp_avgweight_alt$data
+pdp_df$.id <- 1:nrow(pdp_df)
+pdp_df <- pdp_df %>% group_by(avgweight) %>% mutate(redline = mean(yhat))
+
+pdp_avgweight_alt_plot <- ggplot(pdp_df, aes(x = avgweight, y = yhat)) +
+  geom_line(aes(group = yhat.id), color = "purple4", linewidth = 0.1) +
+  geom_line(aes(y = redline), color = "brown2") +
+  labs(x = "Average Weight", y = "Change in Prediction of B-average") 
+
+
+
+
+```
+
+
+```{r,echo=FALSE,fig.align='center'}
+pdp_mechanic_alt <- partial(
+  model_alt, 
+  pred.var = "boardgamemechanic_cnt", 
+  ice = TRUE, 
+  center = TRUE, 
+  plot = TRUE, 
+  rug = TRUE, 
+  alpha = 0.1, 
+  plot.engine = "ggplot2", 
+  train = cv_alt, 
+  type = "regression"
+)
+
+pdp_df_mech <- pdp_mechanic_alt$data
+pdp_df_mech$.id <- 1:nrow(pdp_df_mech)
+pdp_df_mech <- pdp_df_mech %>% group_by(boardgamemechanic_cnt) %>% mutate(redline = mean(yhat))
+pdp_mechanic_alt_plot <- ggplot(pdp_df_mech, aes(x = boardgamemechanic_cnt, y = yhat)) +
+  geom_line(aes(group = yhat.id), color = "purple4", linewidth = 0.1) +
+  geom_line(aes(y = redline), color = "brown2") +
+  labs(x = "Mechanic Count", y = "Change in Prediction of B-average") 
+grid.arrange(pdp_avgweight_alt_plot, pdp_mechanic_alt_plot, ncol = 2)
+
+#pdp_mechanic_alt_plot
+```
+
+
+These PDPs depict the two most important features for the model’s prediction of *baverage* on the x-axis, and the increase/decrease in the model’s prediction, based on each feature alone (other features kept fixed), on the y-axis. The black lines represent prediction changes among each individual observation, while the red line represents the average among these changes. For our purposes, individual y-values are arbitrary, but the trends across the graph signify how different values of these features alter the model’s predictions. 
+
+First, the PDP of *avgweight* (left) exhibited several interesting trends. For *avgweight* values between 1 and 3, the graph trends upwards slightly, indicating that as *avgweight* values increased within this range, the model’s prediction of *baverage* also increased. We can therefore extrapolate that the b-averages in our dataset tend to increase as *avgweight* increases from 1 to 3. This suggests that board gamers view games in the 2-3 complexity interval as higher quality than those in the 1-2 interval. However, their opinions appear to become less concrete as we approach high-complexity games, where the increasing trend does not continue. There is, however, an upward jump around 4.5, meaning that games with weight ratings between 4.5 and 5 get a significantly boosted prediction in the model. Because of their mighty ultra-complexity, these games may be more universally appreciated by the gaming community; even if gamers do not play or particularly enjoy these games, there is something vaguely impressive about their absurdly high complexity. Moreover, there are spikes around *avgweight* values of 2 and 3. This could be due to the presence of more *avgweight* values that are integers like 2 and 3 than, for example, 2.05 and 3.05 (or any other particular rational values). This may have encouraged our model to be more confident in predicting higher increases in the *baverage* for such values. 
+
+The PDP of *boardgamemechanic_cnt* (right) has a more obvious upward trend. With an increased number of mechanics comes an increased prediction of the *baverage*. However, a dip in the graph around 13 suggests that the feature becomes less important once we reach and exceed this value. This suggests board gamers are generally fond of higher mechanic counts; their impression of the game tends to increase as the mechanic count increases, subject to some upper limit that might be perceived as excessive in a game. As a whole, our findings speak to the importance of complexity and diversity of mechanics in board games, within a reasonable limit —-- unless a development company wants to aim for the elusive 5/5 complexity rating!
+
+**Question 2:**
+
+A bigwig board game developer may not only be worried about making the best game, but also where competition exists. One source of competition may be small upstart or indie board games gaining funding and support from board gamers via Kickstarter. In fact, the top rated board game in this dataset, Gloomhaven, was funded in part by Kickstarter. With our second question, we wanted to analyze the effect of Kickstarter funding on our model. Through this process, we hoped to identify any circumstances in which Kickstarter status would have a significant effect, and if our developer should be worried. 
+
+
+```{r, echo=FALSE,warning=FALSE,fig.align='center',results='asis'}
+variables <- c('avgweight', 'baverage', 'numgeeklists', 'numwanting', 'numplays', 'boardgamemechanic_cnt', 'boardgamepublisher_cnt', 'yearpublished', 'boardgamehonor_cnt')
+cor_df <- data.frame()
+for (i in variables) {
+  kick_numeric <- as.numeric(as.character(bg_q2$kick))
+  i_numeric <- as.numeric(as.character(bg_q2[[i]]))
+  cor <- cor.test(kick_numeric, i_numeric, method = "pearson")
+  cor_df <- rbind(cor_df, data.frame(variable = i, `Correlation with Kick`= cor$estimate))
+}
+row.names(cor_df) <- NULL
+#cor_df 
+styled_table_cor <- kable(cor_df, align=rep('c', 15), col.names = gsub("[.]", " ", names(cor_df))) %>%
+  kable_styling(full_width = FALSE, position = "center", latex_options="scale_down") %>%
+  add_header_above(c("Point-Biserial Correlation of Kick with Other Variables" = ncol(cor_df))) %>%
+  row_spec(0, bold = TRUE, background = '#ef3a3b') %>%
+  column_spec(1, bold = TRUE, color = "white", background = '#551a8b') %>%
+  collapse_rows(columns = 1)
+
+
+styled_table_cor
+```
+
+```{r,include=F,fig.align='center',warning=FALSE}
+bg$weightgrouppointfive = cut(bg$avgweight,
+    breaks = c(1,1.5, 2,2.5, 3,3.5, 4,4.5,5),
+    include.lowest = T,
+    right = F)
+levels(bg$weightgrouppointfive) = c("1-1.5","1.5-2","2-2.5","2.5-3","3-3.5","3.5-4","4-4.5","4.5-5")
+
+summ2 = bg %>%
+  group_by(weightgrouppointfive, kick) %>%
+  summarise(count = n())
+
+prop2 = rep(NA, 16)
+for(i in 1:16){
+  kickk = summ2$kick[i]
+  if(kickk == 0){
+    proppp = summ2$count[i]/9351
+    prop2[i] = proppp
+  }
+    if(kickk ==1){
+    proppp = summ2$count[i]/1839
+    prop2[i] = proppp
+  }
+}
+
+summ2$prop = prop2
+summ2
+
+
+```
+
+```{r,echo=FALSE,fig.align='center',warning=FALSE}
+comp_kick <- ggplot(summ2, aes(x = weightgrouppointfive, y = prop, fill = as.factor(kick))) +
+  geom_bar(position = position_dodge(), stat = "identity") +
+  scale_fill_manual(values = c('brown2', 'purple4'), labels = c('No', 'Yes')) +
+  labs(title = "Proportion of Kickstarter and Non-Kickstarter Games By Complexity Intervals", 
+       x = "Complexity Intervals", y = "Proportion", fill = "Kickstarter?") + ylim(0, 0.3)
+
+
+comp_kick
+```
+
+Our group first looked at which variables had notable correlations with *kick*, per the above table (top). Because *kick* is a binary categorical variable, we used point-biserial correlation, which assesses the relationship between a binary and continuous variable. In order to avoid treating the binary variable as a simple numeric variable, the correlation coefficient is calculated from the mean values of each binary case, the standard deviation of all values, and the proportion of values that belong to each binary case. We found that variables with the strongest correlation included *boardgamemechanics_cnt* and *yearpublished*. The correlation between *kick* and *baverage* was insignificant. We then expanded our idea of measure of success to move beyond simply *baverage* and include *numplays* (number of plays), *numwanting* (number of Geeks wantings), *numgeeklists* (number of user-created lists a game is featured in), and *boardgamehonor_cnt* (number of honors a game received). These, too, did not have significant correlations with *kick*. To our surprise, though, the distribution of complexity ratings differed between Kickstarter and non-Kickstarter games (bottom); the prior followed a more normal distribution centered around the interval 2-2.5, while the latter was skewed right. Kickstarter games may be aimed more at “Geek”-centric audience, while non-Kickstarter games may include more commercial games (including children’s games).
+
+```{r,echo=FALSE,fig.align='center'}
+set.seed(154)
+bg_q2 <- bg_q2 %>% filter(avgweight >= 1, midplaytime > 0, midplaytime < 1000, boardgamemechanic_cnt > 0, maxplayers != 999, boardgameartist_cnt != 508, boardgamecategory_cnt > 0)
+
+train_control_q2 <- trainControl(method = "cv", number = 10)
+
+model_formula_q2 <- as.formula("baverage ~ avgweight + kick + boardgamemechanic_cnt + midplaytime + playerage + maxplayers + boardgamecategory_cnt + minplayers")
+
+xgb_grid_q2 <- expand.grid(nrounds = 6000, max_depth = 3, eta = 0.01, gamma = 0.02, colsample_bytree = 1, min_child_weight = 1, subsample = 1)
+
+model_q2 <- train(model_formula_q2, 
+               data = bg_q2, 
+               method = "xgbTree", 
+               trControl = train_control_q2, 
+               tuneGrid = xgb_grid_q2) 
+
+importance_kick<- varImp(model_q2, scale = FALSE)
+importance_df_kick <- as.data.frame(importance_kick$importance)
+importance_df_kick$variable <- rownames(importance_df_kick)
+colors_kick <- ifelse(importance_df_kick$variable == "kick1", 'brown2', 'purple4')
+ggplot(importance_df_kick, aes(x = reorder(variable, Overall), y = Overall, fill = colors_kick)) + geom_bar(stat = "identity")+scale_x_discrete(labels = c("minplayers","kick","boardgamecategory_cnt","maxplayers","midplaytime","playerage","boardgamemechanic_cnt","avgweight")) + coord_flip() + labs(x = "Feature", y = "Importance", title = 'Importance (Gain) of Each Feature in Predicting B-Average') + scale_fill_identity()
+
+
+
+```
+
+
+
+```{r,echo=FALSE, include=FALSE,fig.align='center'}
+bg$kick <- as.numeric(as.character(bg$kick))
+bg<-bg%>%
+  filter(boardgamemechanic_cnt > 0 | avgweight > 0)
+
+train_control <- trainControl(method = "cv", number = 10)
+
+model_formula <- as.formula("baverage ~ avgweight + boardgamemechanic_cnt + midplaytime + playerage + maxplayers + boardgamecategory_cnt + kick + minplayers")
+
+xgb_grid <- expand.grid(nrounds = 6000, max_depth = 3, eta = 0.01, gamma = 0.02, colsample_bytree = 1, min_child_weight = 1, subsample = 1)
+
+model1 <- train(model_formula, 
+               data = bg, 
+               method = "xgbTree", 
+               trControl = train_control, 
+               tuneGrid = xgb_grid) 
+
+print(model1)
+varImp(model1, scale = FALSE)
+
+cv<- data.matrix(bg)
+
+pdp_avgweight <- partial(
+  model1, 
+  pred.var = "avgweight", 
+  ice = TRUE, 
+  center = TRUE, 
+  plot = TRUE, 
+  rug = TRUE, 
+  alpha = 0.1, 
+  plot.engine = "ggplot2", 
+  train = cv, 
+  type = "regression"
+)
+
+pdp_df_kick <- pdp_avgweight$data
+pdp_df_kick$.id <- 1:nrow(pdp_df_kick)
+pdp_df_kick <- pdp_df_kick %>% group_by(avgweight) %>% mutate(redline = mean(yhat))
+
+pdp_avgweight_kick_plot <- ggplot(pdp_df_kick, aes(x = avgweight, y = yhat)) +
+  geom_line(aes(group = yhat.id), color = "purple4", linewidth = 0.1) +
+  geom_line(aes(y = redline), color = "brown2") +
+  labs(x = "Average Weight", y = "Change in Prediction of B-average") 
+
+
+pdp_mech <- partial(
+  model1, 
+  pred.var = "boardgamemechanic_cnt", 
+  ice = TRUE, 
+  center = TRUE, 
+  plot = TRUE, 
+  rug = TRUE, 
+  alpha = 0.1, 
+  plot.engine = "ggplot2", 
+  train = cv, 
+  type = "regression"
+)
+
+
+```
+
+```{r,echo=FALSE,fig.align='center'}
+pdp_df_kick2 <- pdp_mech$data
+pdp_df_kick2$.id <- 1:nrow(pdp_df_kick2)
+pdp_df_kick2<-pdp_df_kick2%>%filter(boardgamemechanic_cnt>0)
+pdp_df_kick2 <- pdp_df_kick2 %>% group_by(boardgamemechanic_cnt) %>% mutate(redline = mean(yhat))
+pdp_mechanic_kick2_plot <- ggplot(pdp_df_kick2, aes(x = boardgamemechanic_cnt, y = yhat)) +
+  geom_line(aes(group = yhat.id), color = "purple4", linewidth = 0.1) +
+  geom_line(aes(y = redline), color = "brown2") +
+  labs(x = "Mechanic Count", y = "Change in Prediction of B-average") 
+grid.arrange(pdp_avgweight_kick_plot, pdp_mechanic_kick2_plot, ncol = 2)
+```
+
+Our next step was to re-test our second GBM model with the added *kick* variable, to assess whether *kick* provides any new information. With the inclusion of *kick*, our RMSE decreased marginally, from 0.3618 to 0.3613. *kick* was considered one of the least important for our model’s predictions, and it had a relative importance of 0.02. *avgweight* and *boardgamemechanic_cnt* remained the two most important variables, with the importance of other variables shifting minimally. The partial dependence plots for *avgweight* and *boardgamemechanic_cnt* also shifted slightly with this new model, indicating that a small amount of explanatory power did go to *kick*. The PDP for *avgweight* lost the upward spike at 3 and the positive jump between 4.5 and 5, but overall it still had its slightly upward slope. This might suggest that *kick* accounts for some of the positive association observed in *baverage* as the games gain complexity. In addition, Kickstarter-funded games tend to have a slightly higher proportion of observations in the 2-4 and 4.5-5 complexity range. Since we know Kickstarter games have a slightly higher *baverage*, the model may be using the *kick* variable to capture the information about certain spikes in *baverage* among higher complexity games. The PDP for *boardgamemechanic_cnt* had a slightly less dramatic drop around 13 mechanics in this model as well, but overall maintained the same shape.
+
+Next, we returned to our list of variables that *kick* had some level of correlation with. By swapping several of these variables in and out of the model, we analyzed whether this allowed *kick* to play a larger predictive role, in addition to how it affected the RMSE. Surprisingly, removing *boardgamemechanics_cnt* decreased the importance of *kick*. Even when modeling with *kick* alongside another variable that had a low importance factor in the model from Question 1 (such as *maxplayers*), *kick* was still considered far less important for the model --— in fact, its relative importance never exceeded 0.16, and dropped as low as 0.008. We then tried filtering the dataset in different ways to see if it caused *kick* to play a more important role. *kick* had slightly more influence on the model when the b-averages of only top 25th percentile board games were being predicted. Moreover, reducing the dataset to games released after Kickstarter’s launch in 2009 - to capture only games that had the potential of Kickstarter funding -  didn’t change the RMSE or the order of variable importance to a significant degree. This suggests that Kickstarter’s arrival on the board game scene did not shake up the relationship of each variable to its respective board game. Finally, we changed the response variable. Running models that predicted various measures of “success” other than *baverage* didn’t result in much difference in the variable importance either. *kick* is still sitting pretty at around 0.02.
+
+For the time being, our board game developer need not worry about Kickstarter games. Although games with *kick* had a positive correlation with *baverage*, our model did not allocate much importance to the *kick* variable. The inclusion of this variable did slightly change our interpretations for the more important features. However, no matter what models we fit, no matter what measures of success we used, no matter what data filtering methods we employed, *kick* never had much kick. Our developer can rest easy knowing the traditionally published board games are not on their way out.   
+
+# CONCLUSION
+Our analysis revolved around two main questions: What board game aspects have the greatest influence on Geeks' ratings, and what kind of board game would receive the highest ratings among Geeks? How do board games that are Kickstarter-funded affect our models, Geeks' ratings, and other measures of success? Using gradient boosting to predict *baverage*, we found *logtotalmedia* had a significant effect on the prediction, but we could not distinguish its influence pre- and post-publication. In a subsequent model, excluding *logtotalmedia*, we discovered *avgweight* and *boardgamemechanic_cnt* were the most useful predictors of a board game’s rating by Geeks. Using partial dependence plots, we concluded that games with greater complexity and quantity of mechanics tend to receive higher ratings among Geeks. Next, we added the Kickstarter variable to a number of GBM models, including our primary model, to test if there were any circumstances in which Kickstarter status has a large effect on a game’s success. We concluded that Kickstarter funding is not a large contributor to success and does not indicate competition to traditionally produced board games.  
+
+There are, of course, limitations to our data analysis, which primarily focuses on data relevant to the Geeks and their opinions. Geeks comprise a community of board game enthusiasts with a profound passion for board games. We must acknowledge that opinions expressed by Geeks might differ from those outside of this community, those being more casual board game enjoyers. Thus, our data represents the views of a somewhat niche user base; factoring in a more general and diverse audience could lead to different results. If other data scientists were to continue investigating these questions and generate new ones, they could begin by incorporating data from beyond BGG. Although most recognize BGG as the authoritative source for board game content, including non-Geek opinions could capture the nuances between gamers’ and non-gamers’ opinions and thereby more accurately represent the entire population. Scraping ratings and information from articles by The New York Times: Wirecutter (their branch that specializes in product reviews) would be a good first step in understanding a casual board gamer’s perspective. What’s more, it would be interesting for further analysis attempts to delve deeper into board game mechanics. We learned that games with increasing mechanic counts experience increasingly boosted b-averages in our model, but we don’t know if the presence of particular mechanics inflates a game’s rating. It may be insightful to fit a GBM made up entirely of categorical decision trees, where each feature is a binary variable indicating if a game contains a certain mechanic, such as “tile placement.” It may also prove worthwhile to focus on specific publisher companies to investigate the relationship of Kickstarter to each individual company. This may illuminate more specific relationships between crowdfunding and the traditional board game industry. 
+
+The continued rise of technology isn’t stopping people from enjoying a good old-fashioned board game, but it is changing how people talk and think about board games. BoardGameGeek is proof of that. If our hypothetical board game developer wants to keep up in this new age, they must use sites like BGG as an analytics tool. You can’t keep trying the same thing over and over, hoping for success. Understanding your audience is part of the game, too. Analyzing datasets similar to the one used in this study allows developers to consider Geeks’ opinions and preferences while still creating fresh and unique games that shake the board game world and keep the board game tradition alive.
+
+
